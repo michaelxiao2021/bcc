@@ -27,7 +27,8 @@ examples = """examples:
     ./sslsniff --no-openssl # don't show OpenSSL calls
     ./sslsniff --no-gnutls  # don't show GnuTLS calls
     ./sslsniff --no-nss     # don't show NSS calls
-    ./sslsniff --hexdump    # show data as hex instead of trying to decode it as UTF-8
+    ./sslsniff --hexdump    # show data as hex instead of trying
+                            # to decode it as UTF-8
 """
 parser = argparse.ArgumentParser(
     description="Sniff SSL data",
@@ -59,30 +60,46 @@ struct probe_SSL_data_t {
         u64 timestamp_ns;
         u32 pid;
         char comm[TASK_COMM_LEN];
-        char v0[464];
+        char v0[MAX_BUF_SIZE];
         u32 len;
 };
 
+BPF_PERCPU_ARRAY(data_map, struct probe_SSL_data_t, 1);
+
 BPF_PERF_OUTPUT(perf_SSL_write);
 
-int probe_SSL_write(struct pt_regs *ctx, void *ssl, void *buf, int num) {
+int probe_SSL_write(struct pt_regs *ctx, void *ssl, void *buf, u32 num) {
         u64 pid_tgid = bpf_get_current_pid_tgid();
         u32 pid = pid_tgid >> 32;
 
         FILTER
 
-        struct probe_SSL_data_t __data = {0};
-        __data.timestamp_ns = bpf_ktime_get_ns();
-        __data.pid = pid;
-        __data.len = num;
+        u32 zero = 0;
+        struct probe_SSL_data_t *__data = data_map.lookup(&zero);
 
-        bpf_get_current_comm(&__data.comm, sizeof(__data.comm));
-
-        if ( buf != 0) {
-                bpf_probe_read_user(&__data.v0, sizeof(__data.v0), buf);
+        if ( !__data ) {
+                return 0;
         }
 
-        perf_SSL_write.perf_submit(ctx, &__data, sizeof(__data));
+        __data->timestamp_ns = bpf_ktime_get_ns();
+        __data->pid = pid;
+        __data->len = num;
+
+        if ( num == 4294967295 ) {
+                return 0;
+        }
+
+        u32 size = ( num > MAX_BUF_SIZE - 1 ) ? (MAX_BUF_SIZE-1) : num;
+
+        bpf_get_current_comm(&__data->comm, sizeof(__data->comm));
+
+        if ( buf != 0) {
+                bpf_probe_read_user(&__data->v0, size, buf);
+        }
+
+        __data->v0[size] = 0;
+
+        perf_SSL_write.perf_submit(ctx, __data, sizeof(*__data));
         return 0;
 }
 
@@ -113,28 +130,49 @@ int probe_SSL_read_exit(struct pt_regs *ctx, void *ssl, void *buf, int num) {
                 return 0;
         }
 
-        struct probe_SSL_data_t __data = {0};
-        __data.timestamp_ns = bpf_ktime_get_ns();
-        __data.pid = pid;
-        __data.len = PT_REGS_RC(ctx);
+        u32 zero = 0;
+        struct probe_SSL_data_t *__data = data_map.lookup(&zero);
 
-        bpf_get_current_comm(&__data.comm, sizeof(__data.comm));
+        if ( !__data ) {
+                return 0;
+        }
+
+        __data->timestamp_ns = bpf_ktime_get_ns();
+        __data->pid = pid;
+        __data->len = PT_REGS_RC(ctx);
+
+        if ( __data->len == 4294967295 ) {
+                return 0;
+        }
+
+        bpf_get_current_comm(&__data->comm, sizeof(__data->comm));
+
+        u32 size = ( __data->len > MAX_BUF_SIZE - 1 ) ? (MAX_BUF_SIZE - 1): __data->len;
 
         if (bufp != 0) {
-                bpf_probe_read_user(&__data.v0, sizeof(__data.v0), (char *)*bufp);
+                bpf_probe_read_user(&__data->v0, size, (char *)*bufp);
         }
+
+        __data->v0[size] = 0;
 
         bufs.delete(&tid);
 
-        perf_SSL_read.perf_submit(ctx, &__data, sizeof(__data));
+        perf_SSL_read.perf_submit(ctx, __data, sizeof(*__data));
         return 0;
 }
 """
+
+# define output data structure in Python
+TASK_COMM_LEN = 16  # linux/sched.h
+MAX_BUF_SIZE = 1024 * 8
+
 
 if args.pid:
     prog = prog.replace('FILTER', 'if (pid != %d) { return 0; }' % args.pid)
 else:
     prog = prog.replace('FILTER', '')
+
+prog = prog.replace('MAX_BUF_SIZE', '%d' % MAX_BUF_SIZE)
 
 if args.debug or args.ebpf:
     print(prog)
@@ -178,10 +216,6 @@ if args.nss:
     b.attach_uretprobe(name="nspr4", sym="PR_Recv",
                        fn_name="probe_SSL_read_exit", pid=args.pid or -1)
 
-# define output data structure in Python
-TASK_COMM_LEN = 16  # linux/sched.h
-MAX_BUF_SIZE = 464  # Limited by the BPF stack
-
 
 # header
 print("%-12s %-18s %-16s %-7s %-6s" % ("FUNC", "TIME(s)", "COMM", "PID",
@@ -224,11 +258,12 @@ def print_event(cpu, data, size, rw, evt):
     fmt = "%-12s %-18.9f %-16s %-7d %-6d\n%s\n%s\n%s\n\n"
     if args.hexdump:
         unwrapped_data = binascii.hexlify(event.v0)
-        data = textwrap.fill(unwrapped_data.decode('utf-8', 'replace'),width=32)
+        data = textwrap.fill(unwrapped_data.decode('utf-8', 'replace'), width=32)
     else:
         data = event.v0.decode('utf-8', 'replace')
     print(fmt % (rw, time_s, event.comm.decode('utf-8', 'replace'),
                  event.pid, event.len, s_mark, data, e_mark))
+
 
 b["perf_SSL_write"].open_perf_buffer(print_event_write)
 b["perf_SSL_read"].open_perf_buffer(print_event_read)
